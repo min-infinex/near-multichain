@@ -1,4 +1,4 @@
-import { base_decode } from 'near-api-js/lib/utils/serialize';
+import { base_decode, base_encode } from 'near-api-js/lib/utils/serialize';
 import { ec as EC } from 'elliptic';
 import { sha3_256 } from 'js-sha3';
 import hash from 'hash.js';
@@ -29,11 +29,12 @@ export function najPublicKeyStrToCompressedPoint(najPublicKeyStr) {
   }
 }
 
-export async function uncompressedHexPointToSegwitAddress(
-  uncompressedHexPoint,
+// compressed or uncompressed both work
+export async function hexPointToSegwitAddress(
+  hexPoint,
   networkPrefix
 ) {
-  const publicKeyBytes = Uint8Array.from(Buffer.from(uncompressedHexPoint, 'hex'));
+  const publicKeyBytes = Uint8Array.from(Buffer.from(hexPoint, 'hex'));
   const sha256HashOutput = await crypto.subtle.digest('SHA-256', publicKeyBytes);
 
   const ripemd160 = hash.ripemd160().update(Buffer.from(sha256HashOutput)).digest();
@@ -66,7 +67,7 @@ export async function deriveChildPublicKey(
   const newPublicKeyPoint = keyPoint.add(scalarTimesG);
 
   // Return the new compressed public key
-  return newPublicKeyPoint.encodeCompressed('hex');
+  return {compressedHex: newPublicKeyPoint.encodeCompressed('hex'), newPublicKeyPoint};
 }
 
 export async function uncompressedHexPointToBtcAddress(
@@ -93,7 +94,7 @@ export async function generateBtcAddress({
   isTestnet = true,
   addressType = 'segwit'
 }) {
-  const childPublicKey = await deriveChildPublicKey(
+  const {compressedHex: childPublicKey, newPublicKeyPoint} = await deriveChildPublicKey(
     najPublicKeyStrToCompressedPoint(MPC_KEY),  // Use the compressed key
     accountId,
     path
@@ -106,13 +107,22 @@ export async function generateBtcAddress({
     address = await uncompressedHexPointToBtcAddress(childPublicKey, networkByte);
   } else if (addressType === 'segwit') {
     const networkPrefix = isTestnet ? 'tb' : 'bc';
-    address = await uncompressedHexPointToSegwitAddress(childPublicKey, networkPrefix);
+    address = await hexPointToSegwitAddress(childPublicKey, networkPrefix);
   } else {
     throw new Error(`Unsupported address type: ${addressType}`);
   }
 
+  // To match NEAR format, first get uncompressed form (starts with '04', total 65 bytes)
+  const uncompressedHex = newPublicKeyPoint.encode('hex', false); // '04' + 64 bytes
+  const rawKeyHex = uncompressedHex.slice(2); // remove the '04', leaving 64 bytes
+  const rawKeyBytes = Buffer.from(rawKeyHex, 'hex');
+
+  // Base58-encode the 64-byte raw key
+  const nearCompatiblePublicKey = `secp256k1:${base_encode(rawKeyBytes)}`;
+
   return {
     address,
-    publicKey: childPublicKey
+    publicKey: childPublicKey,
+    nearCompatiblePublicKey
   };
 }

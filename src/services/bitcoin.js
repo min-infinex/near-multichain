@@ -3,6 +3,7 @@ import { fetchJson } from './utils';
 import * as bitcoinJs from 'bitcoinjs-lib';
 import { generateBtcAddress } from './kdf/btc';
 import { MPC_CONTRACT } from './kdf/mpc';
+import { Psbt } from 'bitcoinjs-lib/src/psbt';
 
 export class Bitcoin {
   name = 'Bitcoin';
@@ -15,13 +16,13 @@ export class Bitcoin {
   }
 
   deriveAddress = async (accountId, derivation_path) => {
-    const { address, publicKey } = await generateBtcAddress({
+    const { address, publicKey, nearCompatiblePublicKey } = await generateBtcAddress({
       accountId,
       path: derivation_path,
       isTestnet: true,
       addressType: 'segwit'
     });
-    return { address, publicKey };
+    return { address, publicKey, nearCompatiblePublicKey };
   }
 
   getUtxos = async ({ address }) => {
@@ -44,7 +45,7 @@ export class Bitcoin {
 
     // Use the utxo with the highest value
     utxos.sort((a, b) => b.value - a.value);
-    utxos = [utxos[0]];
+    // utxos = [utxos[0]];
 
     const psbt = await constructPsbt(address, utxos, to, amount, this.networkId)
     if (!psbt) return
@@ -60,30 +61,64 @@ export class Bitcoin {
     publicKey,
     attachedDeposit = 1,
   }) => {
-    const keyPair = {
-      publicKey: Buffer.from(publicKey, 'hex'),
-      sign: async (transactionHash) => {
-        const utxo = utxos[0]; // The UTXO being spent
-        const value = utxo.value; // The value in satoshis of the UTXO being spent
+    let sigs = []
+    console.log("psbt", psbt) 
+    let fullTransaction = {
+      version: psbt.data.globalMap.unsignedTx.tx.version,
+      locktime: psbt.data.globalMap.unsignedTx.tx.locktime,
+    }
 
-        if (isNaN(value)) {
-          throw new Error(`Invalid value for UTXO at index ${transactionHash}: ${utxo.value}`);
-        }
+    let ins = psbt.data.globalMap.unsignedTx.tx.ins
+    let outs = psbt.data.globalMap.unsignedTx.tx.outs
 
-        const payload = Object.values(ethers.getBytes(transactionHash));
+    fullTransaction.input = ins.map((input, i) => ({
+      previous_output: {
+        txid: input.hash,
+        vout: input.index
+      },
+      sequence: input.sequence,
+    }))
 
-        // Sign the payload using MPC
-        const args = { request: { payload, path, key_version: 0, } };
+    fullTransaction.output = outs.map((output, i) => ({
+      value: output.value,
+      script_pubkey: output.script
+    }))
 
-        const { big_r, s } = await wallet.callMethod({
-          contractId: MPC_CONTRACT,
-          method: 'sign',
-          args,
-          gas: '250000000000000', // 250 Tgas
-          deposit: attachedDeposit,
-        });
+    console.log("fullTransaction", fullTransaction)
 
-        // Reconstruct the signature
+      // Assuming only 3 transactions at a time     
+      // for(let i = 0; i < psbt.data.inputs.length; i+=3) {
+      //   const sigRes = await wallet.callMethod({
+    //     contractId: "permission.testnet",
+    //     method: "permissioned_sign",
+    //     args: {
+    //       fullTransaction,
+    //       indicies: Array.from({ length: 3 }, (_, j) => i + j)
+    //     },
+    //   })
+
+    //   for(let signature of sigRes) {
+    //     let { big_r, s } = signature
+    //     // Reconstruct the signature
+    //     const rHex = big_r.affine_point.slice(2); // Remove the "03" prefix
+    //     let sHex = s.scalar;
+       
+    //     // Pad s if necessary
+    //     if (sHex.length < 64) {
+    //       sHex = sHex.padStart(64, '0');
+    //     }
+       
+    //     const rBuf = Buffer.from(rHex, 'hex');
+    //     const sBuf = Buffer.from(sHex, 'hex');
+       
+    //     // Now encode to DER
+    //     const derSignature = this.encodeToDER(rBuf, sBuf);
+    //     sigs.push(derSignature)
+    //   }
+    // }
+
+    /*
+       // Reconstruct the signature
         const rHex = big_r.affine_point.slice(2); // Remove the "03" prefix
         let sHex = s.scalar;
 
@@ -97,25 +132,132 @@ export class Bitcoin {
 
         // Combine r and s
         return Buffer.concat([rBuf, sBuf]);
-      },
-    };
 
-    // Sign each input manually
-    await Promise.all(
-      utxos.map(async (_, index) => {
-        try {
-          await psbt.signInputAsync(index, keyPair);
-          console.log(`Input ${index} signed successfully`);
-        } catch (e) {
-          console.warn(`Error signing input ${index}:`, e);
+
+        // Insert the signature into the PSBT --> need to signature match??? I doubt these will come back in order from MPC, at least assume it does not until proven otherwise
+        for (let i = 0; i < inputCount; i++) {
+          const derSignature = encodeToDER(signatures[i].r, signatures[i].s);
+          psbt.updateInput(i, {
+            partialSig: [{
+              pubkey: yourPubKeyBuffer,
+              signature: derSignature
+            }]
+          });
         }
-      })
-    );
+    */  
 
-    psbt.finalizeAllInputs(); // Finalize the PSBT
+    // psbt.finalizeAllInputs(); // Finalize the PSBT
 
-    return psbt;  // Return the generated signature
+    // console.log("finalized psbt: ", psbt )
+
+    return null;  // Return the generated signature
   }
+
+  encodeToDER = (r, s) => {
+    // Ensure r and s are Buffers. If they are Uint8Arrays, convert them to Buffers.
+    // If they're hex strings, you can do: r = Buffer.from(r, 'hex'), etc.
+    if (!(r instanceof Buffer)) r = Buffer.from(r);
+    if (!(s instanceof Buffer)) s = Buffer.from(s);
+  
+    // Prepend 0x00 to ensure the integer is positive if MSB is set
+    function prependZeroIfNeeded(x) {
+      if (x.length === 0) {
+        return Buffer.from([0x00]);
+      }
+      if (x[0] & 0x80) {
+        const newBuf = Buffer.alloc(x.length + 1);
+        newBuf[0] = 0x00;
+        x.copy(newBuf, 1);
+        return newBuf;
+      }
+      return x;
+    }
+  
+    const rEncoded = prependZeroIfNeeded(r);
+    const sEncoded = prependZeroIfNeeded(s);
+  
+    // 2 bytes for R header/length + rEncoded.length
+    // 2 bytes for S header/length + sEncoded.length
+    // plus 2 bytes for the SEQUENCE header/length
+    const totalLen = 2 + rEncoded.length + 2 + sEncoded.length;
+    const der = Buffer.alloc(totalLen + 2);
+  
+    // Construct DER
+    der[0] = 0x30; // SEQUENCE tag
+    der[1] = totalLen; // length of all the following data
+    der[2] = 0x02; // INTEGER tag for R
+    der[3] = rEncoded.length;
+    rEncoded.copy(der, 4);
+  
+    const sPos = 4 + rEncoded.length;
+    der[sPos] = 0x02; // INTEGER tag for S
+    der[sPos + 1] = sEncoded.length;
+    sEncoded.copy(der, sPos + 2);
+  
+    return der;
+  }
+
+  /**
+ * Compute the sighash for a given input in a PSBT.
+ * 
+ * @param {Psbt} psbt - The PSBT object from bitcoinjs-lib.
+ * @param {number} inputIndex - The index of the input to sign.
+ * @param {number} sighashType - The desired sighash type (default SIGHASH_ALL: 0x01).
+ * @returns {Buffer} The sighash (32-byte hash that needs to be signed).
+ */
+ computeSighashForInput = ({
+  psbt, 
+  inputIndex, 
+  sighashType = bitcoinJs.Transaction.SIGHASH_ALL
+}) => {
+  // Extract the underlying transaction
+  // NOTE: We can access the underlying unsigned transaction from the psbt's global map.
+  const unsignedTx = psbt.data.globalMap.unsignedTx;
+  if (!unsignedTx) {
+    throw new Error('PSBT does not have an unsigned transaction.');
+  }
+
+  const input = psbt.data.inputs[inputIndex];
+  console.log("input",  input)
+  if (!input) {
+    throw new Error(`Input at index ${inputIndex} does not exist.`);
+  }
+
+  const txForSighash = unsignedTx.tx;
+  
+  let script;
+  let value;
+
+  // Determine input type and retrieve necessary data
+  if (input.witnessUtxo) {
+    console.log("witnessUtxo: ", input.witnessUtxo)
+    // SegWit input
+    script = input.witnessUtxo.script;
+    value = input.witnessUtxo.value;
+
+    // For SegWit v0 inputs:
+    // hashForWitnessV0(inputIndex, script, value, sighashType) 
+    return txForSighash.hashForWitnessV0(inputIndex, script, value, sighashType);
+  } else if (input.nonWitnessUtxo) {
+    // Legacy input
+    // Extract the previous transaction to find the scriptPubKey
+    const prevTx = bitcoinJs.Transaction.fromBuffer(input.nonWitnessUtxo);
+    const prevOutIndex = txForSighash.ins[inputIndex].index;
+    
+    if (prevOutIndex >= prevTx.outs.length) {
+      throw new Error(`Invalid prevOutIndex ${prevOutIndex} for nonWitnessUtxo.`);
+    }
+
+    script = prevTx.outs[prevOutIndex].script;
+    // In legacy transactions, value is not strictly required for sighash computation.
+    // However, for completeness, you can store it if you need it (not needed for legacy sighash).
+    
+    // For Legacy inputs:
+    return txForSighash.hashForSignature(inputIndex, script, sighashType);
+  } else {
+    throw new Error('No witnessUtxo or nonWitnessUtxo provided for this input.');
+  }
+}
 
   broadcastTX = async (signedTransaction) => {
     // broadcast tx
@@ -161,6 +303,7 @@ async function constructPsbt(
 
   await Promise.all(
     utxos.map(async (utxo) => {
+      console.log("utxo", utxo)
       totalInput += utxo.value;
 
       const transaction = await fetchTransaction(networkId, utxo.txid);
